@@ -61,7 +61,6 @@
 # -------------------------------------------------------------------
 
 # 기본 설정 - 스크립트 오류 처리
-export PATH=$PATH:/sbin:/usr/sbin
 set -euo pipefail
 IFS=$'\n\t'
 # set -e: 명령어 실패 시 즉시 종료
@@ -78,14 +77,19 @@ fi
 #######################################################################
 ### [1. 기본 경로 설정] ###############################################
 #######################################################################
+# === 전역 변수 초기화 (set -u 대응) ===
 # 로그 디렉토리 설정
-# LOG_BASE="/var/log/resource_monitor"
-LOG_BASE="/home/user/arsim/opt_script/log"
-LOG_ARCHIVE_DIR="${LOG_BASE}/archive"
-LOG_ALERTS_DIR="${LOG_BASE}/run_alerts"
+# : "${LOG_BASE:=/var/log/resource_monitor}"
+: "${LOG_BASE:=/home/user/arsim/opt_script/log}"
+: "${LOG_ARCHIVE_DIR:=${LOG_BASE}/archive}"
+: "${LOG_ALERTS_DIR:=${LOG_BASE}/run_alerts}"
+: "${ALERT_EXCLUDE_FILE:=$LOG_BASE/alert_exclude_patterns.txt}"
+: "${ALERT_HISTORY_FILE:=$LOG_BASE/alert_history.log}"
+: "${ALERT_CACHE_FILE:=$LOG_BASE/.alert_sent_cache}"
 
 # 로그 파일 경로
-GLOBAL_LOG="$LOG_BASE/global_$(date +%F).log"
+# GLOBAL_LOG="$LOG_BASE/global_$(date +%F).log"
+GLOBAL_LOG="$LOG_BASE/global_test_$(date +%F).log"
 RUN_ALERTS_FILE="${LOG_ALERTS_DIR}/run_alerts_$(date +%F_%H%M%S).log"
 
 # 기타 경로 설정
@@ -100,7 +104,7 @@ mkdir -p "$LOG_BASE" "$LOG_ARCHIVE_DIR" "$LOG_ALERTS_DIR"
 #######################################################################
 # 필수 및 선택적 명령어 정의
 REQUIRED_COMMANDS=("bc" "mail")
-OPTIONAL_COMMANDS=("docker" "sensors" "ifstat" "pidstat" "iostat" "vmstat") # "iotop" 
+OPTIONAL_COMMANDS=("docker" "sensors" "iotop" "ifstat" "pidstat" "iostat" "vmstat")
 
 # 의존성 확인 결과 로깅을 위한 임시 함수
 log_dependency() {
@@ -157,6 +161,20 @@ SERVICES=("sshd" "docker" "nginx" "fail2ban")
 PING_TARGETS=("8.8.8.8" "1.1.1.1")
 MONITOR_INTERVAL=300   # 모니터링 실행 주기 (초) → crontab과는 별개
 
+# 마운트별 디스크 증가 감지 기준 설정
+declare -A DISK_INCREASE_THRESHOLD_BY_MOUNT=(
+    ["/"]=20
+    ["/var"]=10
+    ["/data"]=50
+    ["/home"]=15
+)
+
+# 텍스트를 SHA256 해시로 변환
+hash_text() {
+    echo -n "$1" | sha256sum | awk '{print $1}'
+}
+
+
 #######################################################################
 ### [4. 알림 설정] ####################################################
 #######################################################################
@@ -166,8 +184,8 @@ ENABLE_SLACK_ALERTS=true
 SEND_WARN_EMAILS=true     # WARN 레벨도 이메일로 받기
 
 # 알림 대상 설정 
-ALERT_EMAIL="areum_sim@kolon.com,yeongsin_byeon@kolon.com"
-SLACK_WEBHOOK_URL="https://hooks.slack.com/services/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"
+ALERT_EMAIL="###@###.com"
+SLACK_WEBHOOK_URL="https://hooks.slack.com/services/############"
 
 # 서버 자가 복구 기능 활성화 여부 (위험할 수 있으므로 기본은 false)
 ENABLE_SELF_HEALING=false
@@ -191,40 +209,19 @@ log() {
 run_cmd() {
     local LOG_FILE="$1"
     shift
-    local cmd_name="$1"
-    shift
-    local resolved_cmd
-    resolved_cmd=$(command -v "$cmd_name" 2>/dev/null || true)
-    if [[ -z "$resolved_cmd" && -x "/sbin/$cmd_name" ]]; then
-        resolved_cmd="/sbin/$cmd_name"
-    elif [[ -z "$resolved_cmd" && -x "/usr/sbin/$cmd_name" ]]; then
-        resolved_cmd="/usr/sbin/$cmd_name"
-    fi
-
-    if [[ -z "$resolved_cmd" ]]; then
-        log "❌ Command not found: $cmd_name" "$LOG_FILE"
-        send_alert "Command Not Found" "Command: $cmd_name" "ERROR" "run_cmd"
-        return 127
-    fi
-
-    local timeout_secs=30
     local output
-    output=$(timeout "$timeout_secs" "$resolved_cmd" "$@" 2>&1)
+    output=$("$@" 2>&1) || true
     local exit_code=$?
-
     echo "$output" >> "$LOG_FILE"
 
-    local cmd_str="$resolved_cmd $(printf '%q ' "$@")"
     if [ $exit_code -ne 0 ]; then
-        log "❌ Command failed: $cmd_str (exit $exit_code)" "$LOG_FILE"
-        send_alert "Command Failed" "Command: $cmd_str\nExit code: $exit_code\nOutput:\n$output" "WARN" "run_cmd"
-    else
-        log "✅ Command success: $cmd_str" "$LOG_FILE"
+        local cmd_str
+        cmd_str=$(printf '%q ' "$@")
+        log "Error: Command '$cmd_str' failed with exit code $exit_code" "$LOG_FILE"
+        send_alert "Command Failure" "Command '$cmd_str' failed with exit code $exit_code" "CRIT" "run_cmd"
     fi
     return $exit_code
 }
-
-
 
 # safe_run : 함수 단위 실행 보호 + 상태 로깅
 # 실행 형태 : safe_run 함수명 또는 safe_run my_func "$arg1" "$arg2"
@@ -233,36 +230,38 @@ safe_run() {
     shift
     local log_file="$GLOBAL_LOG"
 
-
-    set +e
-    "$func_name" "$@" 2>> "$log_file"
-    local exit_code=$?
-    set -e
+    local exit_code=0
+    if [ "$#" -eq 0 ]; then
+        # 인자 없이 함수명만 전달된 경우 → 함수 직접 호출
+        "$func_name"
+        exit_code=$?
+    else
+        # 함수명 + 인자 전달 → 인자로 실행
+        "$func_name" "$@"
+        exit_code=$?
+    fi
 
     if [ $exit_code -ne 0 ]; then
         log "❌ $func_name failed (exit code: $exit_code)" "$log_file"
-        send_alert "Function Failed" "Function $func_name failed with exit code $exit_code" "WARN" "$func_name"
     else
-        log "→ $func_name completed successfully" "$log_file"
+        log "→ $func_name completed" "$log_file"
     fi
     return $exit_code
 }
 
-
 # 알림 중복 방지를 위한 함수
 should_send_alert() {
-    local subject="${1:-}"
-    local level="${2:-}"
-    local message="${3:-}"
+    local subject="$1"
+    local level="$2"  # 알림 레벨 전달 (예: CRIT, WARN, INFO)
+    local message="$3"
     local CACHE_FILE="$LOG_BASE/.alert_sent_cache"
     local now=$(date +%s)
 
     mkdir -p "$LOG_BASE"
     touch "$CACHE_FILE"
 
-    # 메시지 내용이 없으면 기본 해시 사용
     local msg_hash
-    msg_hash=$(echo "${message:-NO_MESSAGE}" | md5sum | awk '{print $1}')
+    msg_hash=$(echo "$message" | md5sum | awk '{print $1}')
     local cache_line=$(grep "^${subject}|" "$CACHE_FILE" || true)
 
     # 레벨별 알림 간격 설정
@@ -300,6 +299,17 @@ should_send_alert() {
     return 0
 }
 
+# 알림 필터링 - 제외 설정된 subject/context/message 조합은 스킵
+is_alert_excluded() {
+    local subject="$1"
+    local message="$2"
+    local context="$3"
+    [ ! -f "$ALERT_EXCLUDE_FILE" ] && return 1
+    while IFS='|' read -r p_subject p_context p_message; do
+        [[ "$subject" == *"$p_subject"* && "$context" == *"$p_context"* && "$message" == *"$p_message"* ]] && return 0
+    done < "$ALERT_EXCLUDE_FILE"
+    return 1
+}
 
 # send_slack_alert(): Slack으로 알림 전송
 send_slack_alert() {
@@ -335,7 +345,8 @@ send_slack_alert() {
     esac
 
     # 슬랙 메시지를 간결하게 포맷 (최대 20줄까지만 출력)
-    local formatted_msg=$(echo "$message" | head -20 | sed ':a;N;$!ba;s/\n/\\n/g')
+    local summary="[$level] $subject\n$message"
+    local formatted_msg=$(echo "$summary" | head -20 | sed ':a;N;$!ba;s/\n/\\n/g')
 
     local payload="{
         \"attachments\": [
@@ -353,36 +364,67 @@ send_slack_alert() {
          "$SLACK_WEBHOOK_URL" > /dev/null
 }
 
+# 중복 알림 방지 - subject+message hash 기반으로 처리
+should_send_alert() {
+    local subject="$1"
+    local level="$2"
+    local message="$3"
+
+    mkdir -p "$LOG_BASE"
+    touch "$ALERT_CACHE_FILE"
+
+    local now=$(date +%s)
+    local interval
+    case "$level" in
+        CRIT) interval=600 ;;  # 10분
+        WARN) interval=1800 ;;
+        INFO) interval=3600 ;;
+        *) interval=300 ;;
+    esac
+
+    local hash=$(hash_text "$subject|$message")
+    local last_entry=$(grep "^$hash|" "$ALERT_CACHE_FILE" 2>/dev/null || true)
+
+    if [ -n "$last_entry" ]; then
+        local last_time=$(echo "$last_entry" | cut -d'|' -f2)
+        local count=$(echo "$last_entry" | cut -d'|' -f3)
+        if (( now - last_time < interval )); then
+            count=$((count + 1))
+            sed -i "/^$hash|/d" "$ALERT_CACHE_FILE"
+            echo "$hash|$now|$count" >> "$ALERT_CACHE_FILE"
+            return 1
+        fi
+    fi
+
+    sed -i "/^$hash|/d" "$ALERT_CACHE_FILE"
+    echo "$hash|$now|1" >> "$ALERT_CACHE_FILE"
+    return 0
+}
+
 # send_alert() : 로그에 기록하고, 메일/slack으로 알림 전송
 # - CRIT: 항상 이메일 전송.
 # - WARN: SEND_WARN_EMAILS가 true이면 이메일 전송.
 send_alert() {
-    local subject="${1:-Unknown Alert}"
-    local message="${2:-(no message)}"
-    local level="${3:-INFO}"
-    local context="${4:-}"  # 함수명 또는 추가정보
-
-    # context가 제공되면 메시지 앞에 붙임
-    if [ -n "$context" ]; then
-        message="[$context]\n$message"
-    fi
-    
-    local ALERT_CACHE_FILE="$LOG_BASE/.alert_sent_cache"
-
-    # 모든 알림을 로그에 기록 (INFO도 포함)
-    log "[${level}] ${subject}: ${message}" "$LOG_BASE/alerts_$(date +%F).log"
-    echo "[$(date '+%F %T')] [${level}] ${subject}: ${message}" >> "$RUN_ALERTS_FILE"
-    
-    # INFO는 알림 전송하지 않음
-    if [ "$level" = "INFO" ]; then
+    local subject="$1"
+    local message="$2"
+    local level="$3"  # INFO, WARN, CRIT
+    local context="$4"  # (함수 이름 또는 로그 파일 정보)
+    if is_alert_excluded "$subject" "$message" "$context"; then
+        log "⏩ Excluded alert skipped: $subject ($context)" "$GLOBAL_LOG"
         return
     fi
 
-    # 중복 전송 방지 (최근 5분 내 동일 subject가 있으면 전송하지 않음)
-    if ! should_send_alert "$subject" "$level"; then
+    log "[$level] $subject: $message" "$LOG_BASE/alerts_$(date +%F).log"
+    echo "[$(date '+%F %T')] [$level] $subject: $message" >> "$RUN_ALERTS_FILE"
+    echo "$(date '+%F %T')|$subject|$level" >> "$ALERT_HISTORY_FILE"
+
+    if [ "$level" = "INFO" ]; then return; fi
+
+    if ! should_send_alert "$subject" "$level" "$message"; then
+        log "↩️ Skipping duplicate alert: $subject ($level)" "$GLOBAL_LOG"
         return
     fi
-    
+
     local decorated_subject
     if [ "$level" == "CRIT" ]; then
         decorated_subject="-------- !!! [CRIT] Server Alert: $subject !!! --------"
@@ -450,9 +492,8 @@ collect_system_summary() {
     
     # 스왑 사용량
     log "--- Swap Usage ---" "$LOG_FILE"
-
-    run_cmd "$LOG_FILE" swapon --show || true
-
+    run_cmd "$LOG_FILE" swapon --show >> "$LOG_FILE" || true
+    
     # 디스크 정보
     log "--- Disk Usage ---" "$LOG_FILE"
     run_cmd "$LOG_FILE" df -h >> "$LOG_FILE" || true
@@ -599,7 +640,7 @@ check_docker_volume_usage() {
     if command -v docker &>/dev/null; then
         run_cmd "$LOG_FILE" docker volume ls -q | while read volume; do
             local mountpoint usage
-            mountpoint=$(run_cmd "$LOG_FILE" timeout 5s docker volume inspect "$volume" -f '{{ .Mountpoint }}')
+            mountpoint=$(docker volume inspect "$volume" -f '{{ .Mountpoint }}')
             if [ -d "$mountpoint" ]; then
                 usage=$(du -sh "$mountpoint" 2>/dev/null | awk '{print $1}')
                 log "Volume: $volume ($mountpoint) → $usage" "$LOG_FILE"
@@ -638,7 +679,7 @@ check_network_status() {
     local ping_failures=0
     for target in "${PING_TARGETS[@]}"; do
         log "Pinging $target..." "$LOG_FILE"
-        if ! run_cmd "$LOG_FILE" timeout 5s ping -c 3 -W 2 "$target" >> "$LOG_FILE" 2>&1; then
+        if ! ping -c 3 -W 2 "$target" >> "$LOG_FILE" 2>&1; then
             ping_failures=$((ping_failures + 1))
             log "⚠️ Failed to ping $target" "$LOG_FILE"
         fi
@@ -650,7 +691,7 @@ check_network_status() {
 
     # DNS 해상도 테스트
     log "--- DNS Resolution Test ---" "$LOG_FILE"
-    if ! run_cmd "$LOG_FILE" timeout 5s host -t A google.com >> "$LOG_FILE" 2>&1; then
+    if ! host -t A google.com >> "$LOG_FILE" 2>&1; then
         send_alert "DNS Resolution Failure" "Failed to resolve domain names. Check DNS configuration." "WARN" "check_network_status ($LOG_FILE)"
     fi
 
@@ -734,7 +775,7 @@ check_process_usage() {
                         container_id=$(cat /proc/$pid/cgroup 2>/dev/null | grep "docker" | awk -F/ '{print $3}' | head -1)
                         if [ -n "$container_id" ]; then
                             local container_name
-                            container_name=$(timeout 5s docker inspect --format '{{.Name}}' "$container_id" 2>/dev/null | sed 's/^\///')
+                            container_name=$(docker inspect --format '{{.Name}}' "$container_id" 2>/dev/null | sed 's/^\///')
                             log "→ Container $container_name ($container_id) has high resource usage processes" "$LOG_FILE"
                             docker stats --no-stream "$container_id" >> "$LOG_FILE" 2>&1 || true
                             # 중요 컨테이너(예: db, prod 등)는 자동 재시작하지 않고 치명 알림
@@ -777,19 +818,9 @@ check_process_usage() {
     set -e
 
     if [ -f "$TMP_FILE" ]; then
-        local live_pids_file
-        live_pids_file=$(mktemp)
-
-        # 현재 살아있는 PID 목록 저장
-        ps -eo pid | tail -n +2 > "$live_pids_file"
-
-        # tmp 파일에서 존재하지 않는 pid들 제거
-        grep -vFx -f "$live_pids_file" "$TMP_FILE" > "$TMP_FILE.cleaned" 2>/dev/null || true
-        mv "$TMP_FILE.cleaned" "$TMP_FILE" 2>/dev/null || true
-
-        rm -f "$live_pids_file"
+        run_cmd "$LOG_FILE" grep -vFx -f <(ps -eo pid | tail -n +2) "$TMP_FILE" > "$TMP_FILE.cleaned" 2>/dev/null || true
+        run_cmd "$LOG_FILE" mv "$TMP_FILE.cleaned" "$TMP_FILE" 2>/dev/null || true
     fi
-
 
     # TMP_FILE 정리: 사용 후 반드시 삭제
     rm -f "$TMP_FILE"
@@ -803,7 +834,8 @@ check_io_heavy_processes() {
     log "====== check_io_heavy_processes ======" "$LOG_FILE"
 
     if command -v iotop &>/dev/null; then
-        run_cmd "$LOG_FILE" timeout 10s iotop -b -n 3 -o >> "$LOG_FILE" 2>/dev/null || true
+        # iotop이 있는 경우 원래 방식대로 실행
+        run_cmd "$LOG_FILE" iotop -b -n 3 -o | head -20 >> "$LOG_FILE" 2>/dev/null || true
         
         # I/O 사용량이 높은 프로세스가 있는지 간단히 확인 (옵션)
         local high_io_detected
@@ -814,24 +846,10 @@ check_io_heavy_processes() {
         else
             log "→ No significant I/O activity detected" "$LOG_FILE"
         fi
-
     elif command -v pidstat &>/dev/null; then
         # iotop이 없으면 pidstat으로 대체
         log "iotop not found, using pidstat for I/O monitoring..." "$LOG_FILE"
-
-        local tmp_pidstat_log
-        tmp_pidstat_log=$(mktemp /tmp/pidstat_output.XXXXXX)
-
-        if timeout 10s pidstat -d 1 5 > "$tmp_pidstat_log" 2>&1; then
-            awk 'NR > 7 { print }' "$tmp_pidstat_log" >> "$LOG_FILE"
-            log "→ pidstat output saved" "$LOG_FILE"
-        else
-            log "❌ pidstat failed or timed out after 10s" "$LOG_FILE"
-            send_alert "pidstat Timeout" "pidstat command failed or hung beyond timeout." "WARN" "check_io_heavy_processes ($LOG_FILE)"
-        fi
-
-        rm -f "$tmp_pidstat_log"
-
+        run_cmd "$LOG_FILE" pidstat -d 1 5 | awk 'NR > 7 { print }' >> "$LOG_FILE" 2>/dev/null || true
     else
         # 둘 다 없는 경우 대체 명령어로 I/O 상태 확인
         log "I/O monitoring tools not found. Using alternative methods..." "$LOG_FILE"
@@ -905,11 +923,10 @@ check_services() {
     # Docker 컨테이너 상태 확인 (docker 명령어가 존재할 경우)
     if command -v docker &> /dev/null; then
         log "--- Docker Container Status ---" "$LOG_FILE"
-
-        run_cmd "$LOG_FILE" timeout 5s docker ps -a >> "$LOG_FILE" || true
+        docker ps -a >> "$LOG_FILE" || true
         local stopped_containers
         # 중지된 컨테이너 확인
-        stopped_containers=$(run_cmd "$LOG_FILE" timeout 5s docker ps -f "status=exited" -q)
+        stopped_containers=$(docker ps -f "status=exited" -q)
         if [ -n "$stopped_containers" ]; then
             log "→ Found stopped containers: $stopped_containers" "$LOG_FILE"
             send_alert "Stopped Containers" "Some Docker containers are not running" "INFO"  "check_services ($LOG_FILE)"
@@ -925,7 +942,7 @@ check_system_temperature() {
     log "====== check_system_temperature ======" "$LOG_FILE"
 
     if command -v sensors &>/dev/null; then
-        run_cmd "$LOG_FILE" timeout 5s sensors >> "$LOG_FILE" 2>&1 || true
+        run_cmd "$LOG_FILE" sensors >> "$LOG_FILE" 2>&1 || true
         # 온도가 설정 임계치 이상이면 경고
         local high_temp
         high_temp=$(sensors | awk '/°C/ { if ($2+0 > '$TEMP_THRESHOLD') print $2 }')
@@ -1045,9 +1062,7 @@ manage_zombie_processes() {
             local count=${container_zombie_count["$cname"]}
             if [ "$count" -ge "$ZOMBIE_KILL_THRESHOLD" ]; then
                 log "→ Checking restart policy for container $cname" "$LOG_FILE"
-                # local restart_policy=$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$cname" 2>/dev/null)
-                local restart_policy=$(timeout 5s docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$cname" 2>/dev/null || echo "")
-                timeout 10s docker restart "$cname" >> "$LOG_FILE" 2>&1 && send_alert "Zombie Cleanup" "Restarted container $cname due to $count zombie processes" "INFO" "manage_zombie_processes ($LOG_FILE)"
+                local restart_policy=$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$cname" 2>/dev/null)
                 log "→ Restart policy for $cname: $restart_policy" "$LOG_FILE"
 
                 if [ "$restart_policy" = "" ] || [ "$restart_policy" = "no" ]; then
@@ -1073,7 +1088,7 @@ check_labelStudio_backup_status() {
     # Label Studio 백업 스크립트 실행
     if [ -f "$LABEL_STUDIO_BACKUP_SCRIPT" ]; then
         log "--- Label Studio Backup ---" "$LOG_FILE"
-        if run_cmd "$LOG_FILE" timeout 60s python3 "$LABEL_STUDIO_BACKUP_SCRIPT" >> "$LOG_FILE" 2>&1; then
+        if python3 "$LABEL_STUDIO_BACKUP_SCRIPT" >> "$LOG_FILE" 2>&1; then
             log "✅ Label Studio backup SUCCESS" "$LOG_FILE"
         else
             log "❌ Label Studio backup FAILED" "$LOG_FILE"
@@ -1111,8 +1126,8 @@ server_self_healing() {
         fi
         
         log "→ 실패한 서비스 $failed_unit 재시작 시도" "$LOG_FILE"
-        run_cmd "$LOG_FILE" timeout 5s systemctl restart "$failed_unit"
-
+        run_cmd "$LOG_FILE" systemctl restart "$failed_unit" >> "$LOG_FILE" 2>&1 || true
+        
         # 재시작 성공 여부 확인
         if systemctl is-active --quiet "$failed_unit"; then
             log "✅ 서비스 $failed_unit 복구 성공" "$LOG_FILE"
@@ -1154,31 +1169,21 @@ analyze_container_logs() {
         docker ps --format "{{.Names}}" | while read container; do
             log "-- 컨테이너 로그 분석: $container ------" "$LOG_FILE"
             
-            # 오류 및 경고 로그 추출 (타임아웃 강제 종료 포함 + 실패 허용)
-            if ! timeout --signal=SIGKILL 30s docker logs --tail 100 "$container" 2>&1 | \
-               grep -iE "error|warn|exception|fail|fatal" | tail -10 >> "$LOG_FILE"; then
-                log "⚠️ Timeout or error getting logs for $container (tail 100)" "$LOG_FILE"
-            fi
+            # 오류 및 경고 로그 추출
+            timeout 30s docker logs --tail 100 "$container" 2>&1 | grep -i "error\|warn\|exception\|fail\|fatal" | tail -10 >> "$LOG_FILE" 2>/dev/null || log "Timeout or error getting logs for $container" "$LOG_FILE"
 
-            # 오류 빈도 확인 (tail 1000)
+            # 오류 빈도 확인
             local error_count
-            error_count=$(timeout --signal=SIGKILL 10s docker logs --tail 1000 "$container" 2>&1 | \
-                grep -icE "error|exception|fatal" 2>/dev/null || echo 0)
-
-            if [[ "$error_count" =~ ^[0-9]+$ ]] && [ "$error_count" -gt 50 ]; then
-                send_alert "Container Errors" \
-                    "Container $container has $error_count errors in recent logs" \
-                    "WARN" "analyze_container_logs ($LOG_FILE)"
+            error_count=$(timeout 10s docker logs --tail 1000 "$container" 2>&1 | grep -ic "error\|exception\|fatal") || true
+            if [ "$error_count" -gt 50 ]; then
+                send_alert "Container Errors" "Container $container has $error_count errors in recent logs" "WARN" "analyze_container_logs ($LOG_FILE)"
             fi
             
             # 재시작 수 확인
             local restart_count
-            restart_count=$(docker inspect "$container" --format '{{.RestartCount}}' 2>/dev/null || echo 0)
-
+            restart_count=$(docker inspect "$container" --format '{{.RestartCount}}') || true
             if [ "$restart_count" -gt 5 ]; then
-                send_alert "Container Restarts" \
-                    "Container $container has restarted $restart_count times" \
-                    "WARN" "analyze_container_logs ($LOG_FILE)"
+                send_alert "Container Restarts" "Container $container has restarted $restart_count times" "WARN" "analyze_container_logs ($LOG_FILE)"
             fi
         done
     else
@@ -1196,11 +1201,10 @@ monitor_ssh_stability() {
     ## [1] SSH 연결 끊김 횟수 (최근 1시간)
     local disconnects=0
     if command -v journalctl &>/dev/null; then
-        disconnects=$(run_cmd "$LOG_FILE" timeout 5s journalctl -u sshd --since "1 hour ago" 2>/dev/null | grep -Ei "Connection closed|Disconnecting" | wc -l | tr -d ' \n\t\r' || echo 0)
+        disconnects=$(journalctl -u sshd --since "1 hour ago" 2>/dev/null | grep -Ei "Connection closed|Disconnecting" | wc -l | tr -d ' \n\t\r' || echo 0)
     else
         disconnects=$(grep -Ei "Connection closed|Disconnecting" /var/log/auth.log 2>/dev/null | grep "$(date '+%b %e')" | wc -l | tr -d ' \n\t\r' || echo 0)
     fi
-
     if ! [[ "$disconnects" =~ ^[0-9]+$ ]]; then
         disconnects=0
     fi
@@ -1226,8 +1230,7 @@ monitor_ssh_stability() {
 
     ## [3] CLOSE_WAIT 세션 수 (소켓 누수 가능성)
     local close_wait_count=0
-    close_wait_count=$(run_cmd "$LOG_FILE" timeout 5s ss -tan 2>/dev/null | grep CLOSE-WAIT | wc -l | tr -d ' \n\t\r' || echo 0)
-    
+    close_wait_count=$(ss -tan 2>/dev/null | grep CLOSE-WAIT | wc -l | tr -d ' \n\t\r' || echo 0)
     if ! [[ "$close_wait_count" =~ ^[0-9]+$ ]]; then
         close_wait_count=0
     fi
@@ -1272,31 +1275,37 @@ monitor_ssh_security() {
 
     ## [1] SSH 로그인 실패 시도 감지 (로그 파일 분석)
     local failed_logins=0
-    failed_logins=$(run_cmd "$LOG_FILE" grep -i "Failed password" /var/log/auth.log 2>/dev/null | wc -l | tr -d ' \n\t\r' || echo 0)
-    [[ "$failed_logins" =~ ^[0-9]+$ ]] || failed_logins=0
+    failed_logins=$(grep -i "Failed password" /var/log/auth.log 2>/dev/null | wc -l | tr -d ' \n\t\r' || echo 0)
+    if ! [[ "$failed_logins" =~ ^[0-9]+$ ]]; then
+        failed_logins=0
+    fi
     
     log "→ SSH failed login attempts (total): $failed_logins" "$LOG_FILE"
     
     # 최근 실패 (journalctl이 있는 경우 더 정확한 시간 필터링 가능)
     local recent_failures=0
     if command -v journalctl &>/dev/null; then
-        recent_failures=$(run_cmd "$LOG_FILE" timeout 5s journalctl -u sshd --since "3 hour ago" 2>/dev/null | grep -c "Failed password" || echo 0)
-        [[ "$recent_failures" =~ ^[0-9]+$ ]] || recent_failures=0
+        recent_failures=$(journalctl -u sshd --since "3 hour ago" 2>/dev/null | grep -c "Failed password" || echo 0)
+        if ! [[ "$recent_failures" =~ ^[0-9]+$ ]]; then
+            recent_failures=0
+        fi
         log "→ Recent SSH login failures (3h): $recent_failures" "$LOG_FILE"
     fi
     
     # 경고 생성 (최근 실패가 확인된 경우 그 값 사용, 아니면 전체 실패 수 기준)
-    local threshold_count=${recent_failures:-$failed_logins}
+    local threshold_count=0
     local threshold=20
+    
+    # 가능한 경우 최근 실패 수 사용, 없으면 전체 실패 수 사용
+    threshold_count=${recent_failures:-$failed_logins}
     
     # 값이 숫자인지 확인하고 임계값과 비교
     if [[ "$threshold_count" =~ ^[0-9]+$ ]] && [ "$threshold_count" -ge "$threshold" ]; then
         # 공격자 IP 통계 (상위 5개만)
         local attacking_ips
-        attacking_ips=$(run_cmd "$LOG_FILE" grep "Failed password" /var/log/auth.log 2>/dev/null | awk '{print $11}' | sort | uniq -c | sort -nr | head -5 || echo "IP 정보를 추출할 수 없습니다.")
-        send_alert "SSH Brute Force Attempt" \
-            "Detected $threshold_count failed SSH login attempts.\nTop attacking IPs:\n$attacking_ips" \
-            "WARN" "monitor_ssh_security ($LOG_FILE)"
+        attacking_ips=$(grep "Failed password" /var/log/auth.log 2>/dev/null | awk '{print $11}' | sort | uniq -c | sort -nr | head -5 || echo "IP 정보를 추출할 수 없습니다.")
+        
+        send_alert "SSH Brute Force Attempt" "Detected $threshold_count failed SSH login attempts.\nTop attacking IPs:\n$attacking_ips" "WARN" "monitor_ssh_security ($LOG_FILE)"
     fi
 
     ## [2] fail2ban 상태 확인 (설치된 경우)
@@ -1312,7 +1321,7 @@ monitor_ssh_security() {
         
         # sshd jail 상태 확인
         local status_output
-        status_output=$(run_cmd "$LOG_FILE" timeout 5s fail2ban-client status sshd 2>&1 || echo "Failed to get fail2ban status")
+        status_output=$(fail2ban-client status sshd 2>&1 || echo "Failed to get fail2ban status")
         echo "$status_output" >> "$LOG_FILE"
         
         # 차단된 IP 추출
@@ -1331,7 +1340,7 @@ monitor_ssh_security() {
             
             local new_ips=""
             if [ -f "$banned_ips_old_file" ]; then
-                new_ips=$(comm -23 <(sort "$banned_ips_file") <(sort "$banned_ips_old_file") || echo "$banned_ips")
+                new_ips=$(comm -23 <(sort "$banned_ips_file") <(sort "$banned_ips_old_file") 2>/dev/null || echo "$banned_ips")
             else
                 new_ips="$banned_ips"
             fi
@@ -1349,24 +1358,29 @@ monitor_ssh_security() {
             else
                 log "→ No newly banned IPs detected." "$LOG_FILE"
             fi
-        fi  
+
+        else
+            log "→ No banned IPs found" "$LOG_FILE"
+        fi
+        
         # 반복 차단 IP 분석 (fail2ban_ip_history.log가 있는 경우)
         if [ -f "$LOG_BASE/fail2ban_ip_history.log" ]; then
             log "--- Repeat Offender Analysis ---" "$LOG_FILE"
-            run_cmd "$LOG_FILE" tail -n 1000 "$LOG_BASE/fail2ban_ip_history.log" | \
-                grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort | uniq -c | sort -nr | head -5 > /tmp/fail2ban_stats.txt || true
-
-            cat /tmp/fail2ban_stats.txt >> "$LOG_FILE" || true
-
+            
+            tail -n 1000 "$LOG_BASE/fail2ban_ip_history.log" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | \
+                sort | uniq -c | sort -nr | head -5 > "/tmp/fail2ban_stats.txt" || true
+            
+            cat "/tmp/fail2ban_stats.txt" >> "$LOG_FILE" || true
+            
+            # 5회 이상 반복 차단된 IP 알림
             while read -r count ip; do
                 if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -ge 5 ]; then
                     send_alert "Repeat Fail2Ban Offender" \
                         "IP $ip was banned $count times recently.\nConsider permanent blocking at firewall level." \
                         "WARN" "monitor_ssh_security ($LOG_FILE)"
                 fi
-            done < /tmp/fail2ban_stats.txt 2>/dev/null || true
+            done < "/tmp/fail2ban_stats.txt" 2>/dev/null || true
         fi
-
     else
         log "→ fail2ban is not installed" "$LOG_FILE"
         send_alert "Fail2Ban Missing" "fail2ban이 설치되어 있지 않습니다. 서버 보안을 위해 설치를 권장합니다." "WARN" "monitor_ssh_security ($LOG_FILE)"
@@ -1518,7 +1532,7 @@ manage_system_resources() {
             log "→ Dropped filesystem caches to free memory" "$LOG_FILE"
             
             # 스왑 공간 확보
-            run_cmd "$LOG_FILE" swapoff -a && run_cmd "$LOG_FILE" swapon -a || true
+            swapoff -a && swapon -a >> "$LOG_FILE" 2>&1 || true
             log "→ Cycled swap space to reduce fragmentation" "$LOG_FILE"
         fi
     fi
@@ -1600,8 +1614,7 @@ manage_memory_pressure() {
         sync && echo 3 > /proc/sys/vm/drop_caches 2>> "$LOG_FILE" || true
         log "→ Dropped filesystem caches to free memory" "$LOG_FILE"
 
-        # swapoff -a && swapon -a >> "$LOG_FILE" 2>&1 || true
-        run_cmd "$LOG_FILE" swapoff -a && run_cmd "$LOG_FILE" swapon -a || true
+        swapoff -a && swapon -a >> "$LOG_FILE" 2>&1 || true
         log "→ Cycled swap space to reduce fragmentation" "$LOG_FILE"
     fi
 }
@@ -1718,79 +1731,129 @@ clean_old_logs() {
     return 0
 }
 
+# generate_summary() 보완: 하루 동안 발생한 알림 통계 포함
+generate_alert_statistics() {
+    local summary_file="$1"
+    echo -e "\n--- Daily Alert Statistics ---" >> "$summary_file"
 
-# generate_summary(): 서버 상태 요약 보고서를 생성하고, CRIT/WARN 알림이 있는 경우 이메일로 전체 전송하고 슬랙에는 요약만 전송합니다.
-# - 매 실행 시 'summary_current_<date>.log'로 저장되고, 직전 요약은 'summary_prev_<date>.log'로 백업됩니다.
-# - 전체 내용은 GLOBAL_LOG에 남기지 않고, 결과 완료 메시지만 남깁니다.
-generate_summary() {
-    local SUMMARY_FILE="$LOG_BASE/summary_current_$(date +%F).log"
-    local PREV_SUMMARY_FILE="$LOG_BASE/summary_prev_$(date +%F).log"
+    if [ -f "$ALERT_HISTORY_FILE" ]; then
+        local total crit warn info
+        total=$(wc -l < "$ALERT_HISTORY_FILE")
+        crit=$(grep -c '|CRIT' "$ALERT_HISTORY_FILE")
+        warn=$(grep -c '|WARN' "$ALERT_HISTORY_FILE")
+        info=$(grep -c '|INFO' "$ALERT_HISTORY_FILE")
 
-    # 기존 요약 로그가 있으면 백업
-    if [ -f "$SUMMARY_FILE" ]; then
-        mv "$SUMMARY_FILE" "$PREV_SUMMARY_FILE"
+        echo "Total alerts: $total (CRIT: $crit, WARN: $warn, INFO: $info)" >> "$summary_file"
+        echo >> "$summary_file"
+        echo "Top Alert Subjects:" >> "$summary_file"
+        cut -d'|' -f2 "$ALERT_HISTORY_FILE" | sort | uniq -c | sort -nr | head -5 >> "$summary_file"
+    else
+        echo "No alerts recorded today." >> "$summary_file"
     fi
+}
 
+
+# generate_summary(): 일일 요약 보고서를 생성하고, 치명/경고 알림 발생 시 이메일/슬랙으로 전송합니다.
+# generate_summary() {
+#     local SUMMARY_FILE="$LOG_BASE/daily_summary_$(date +%F).log"
+#     log "====== generate_summary ======" "$SUMMARY_FILE"
+
+#     log "--- Disk Usage Summary ---" "$SUMMARY_FILE"
+#     df -h | grep -vE "tmpfs|udev|loop" >> "$SUMMARY_FILE"
+
+#     log "--- Disk Usage Change ---" "$SUMMARY_FILE"
+#     if [ -f "$LOG_BASE/.prev_disk_usage" ]; then
+#         cat "$LOG_BASE/.prev_disk_usage" >> "$SUMMARY_FILE"
+#     else
+#         echo "(No previous usage data)" >> "$SUMMARY_FILE"
+#     fi
+
+#     log "--- LVM/Overlay/tmpfs Filesystems ---" "$SUMMARY_FILE"
+#     df -hT | grep -E "lvm2|overlay|tmpfs" >> "$SUMMARY_FILE"
+
+#     log "--- Memory Usage Summary ---" "$SUMMARY_FILE"
+#     free -h >> "$SUMMARY_FILE"
+
+#     log "--- CPU Usage Summary ---" "$SUMMARY_FILE"
+#     top -b -n 1 | head -15 >> "$SUMMARY_FILE"
+
+#     log "--- Load Average ---" "$SUMMARY_FILE"
+#     uptime >> "$SUMMARY_FILE"
+
+#     log "--- Reboot History ---" "$SUMMARY_FILE"
+#     uptime -s >> "$SUMMARY_FILE"
+#     last reboot | head -5 >> "$SUMMARY_FILE"
+
+#     log "--- Kernel Logs (dmesg tail) ---" "$SUMMARY_FILE"
+#     dmesg -T | tail -10 >> "$SUMMARY_FILE"
+#     log "--- Services Status Summary ---" "$SUMMARY_FILE"
+#     for svc in "${SERVICES[@]}"; do
+#         local status
+#         status=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
+#         echo "$svc: $status" >> "$SUMMARY_FILE"
+#     done
+    
+#     # 알림 요약
+#     log "--- Recent Alerts Summary ---" "$SUMMARY_FILE"
+#     tail -n 20 "$RUN_ALERTS_FILE" >> "$SUMMARY_FILE"
+
+#     generate_alert_statistics "$SUMMARY_FILE"
+
+#     if grep -q "\[CRIT\]\|\[WARN\]" "$RUN_ALERTS_FILE"; then
+#         cat "$SUMMARY_FILE" | mail -s "Server Monitoring Summary - $(hostname) - $(date +%F)" "$ALERT_EMAIL"
+#         send_slack_alert "Server Monitoring Summary - $(hostname) - $(date +%F)" "$(cat "$SUMMARY_FILE")" "INFO"
+#     fi
+# }
+generate_summary() {
+    local SUMMARY_FILE="$LOG_BASE/daily_summary_$(date +%F).log"
     log "====== generate_summary ======" "$SUMMARY_FILE"
 
     log "--- Disk Usage Summary ---" "$SUMMARY_FILE"
-    local disk_output=$(df -h | grep -vE "tmpfs|udev|loop")
-    echo "$disk_output" >> "$SUMMARY_FILE"
+    df -h | grep -vE "tmpfs|udev|loop" >> "$SUMMARY_FILE" 2>&1 || true
 
     log "--- Disk Usage Change ---" "$SUMMARY_FILE"
     if [ -f "$LOG_BASE/.prev_disk_usage" ]; then
-        local prev_disk_usage=$(cat "$LOG_BASE/.prev_disk_usage")
-        echo "$prev_disk_usage" >> "$SUMMARY_FILE"
+        cat "$LOG_BASE/.prev_disk_usage" >> "$SUMMARY_FILE"
     else
         echo "(No previous usage data)" >> "$SUMMARY_FILE"
     fi
 
     log "--- LVM/Overlay/tmpfs Filesystems ---" "$SUMMARY_FILE"
-    local lvm_info=$(df -hT | grep -E "lvm2|overlay|tmpfs")
-    echo "$lvm_info" >> "$SUMMARY_FILE"
+    df -hT | grep -E "lvm2|overlay|tmpfs" >> "$SUMMARY_FILE"
+    timeout 5s df -hT | grep -E "lvm2|overlay|tmpfs" >> "$SUMMARY_FILE" 2>/dev/null || true
 
     log "--- Memory Usage Summary ---" "$SUMMARY_FILE"
-    local mem_info=$(free -h)
-    echo "$mem_info" >> "$SUMMARY_FILE"
+    timeout 5s free -h >> "$SUMMARY_FILE" 2>/dev/null || true
 
     log "--- CPU Usage Summary ---" "$SUMMARY_FILE"
-    local cpu_info=$(top -b -n 1 | head -15)
-    echo "$cpu_info" >> "$SUMMARY_FILE"
+    timeout 5s top -b -n 1 | head -15 >> "$SUMMARY_FILE" 2>/dev/null || true
 
     log "--- Load Average ---" "$SUMMARY_FILE"
-    local uptime_info=$(uptime)
-    echo "$uptime_info" >> "$SUMMARY_FILE"
+    timeout 5s uptime >> "$SUMMARY_FILE" 2>/dev/null || true
 
     log "--- Reboot History ---" "$SUMMARY_FILE"
-    local reboot_info
-    reboot_info=$(uptime -s && last reboot | head -5)
-    echo "$reboot_info" >> "$SUMMARY_FILE"
+    timeout 5s uptime -s >> "$SUMMARY_FILE" 2>/dev/null || true
+    last reboot | head -5 >> "$SUMMARY_FILE" 2>/dev/null || true
 
     log "--- Kernel Logs (dmesg tail) ---" "$SUMMARY_FILE"
-    local dmesg_tail=$(dmesg -T | tail -10)
-    echo "$dmesg_tail" >> "$SUMMARY_FILE"
-
+    timeout 5s dmesg -T | tail -10 >> "$SUMMARY_FILE" 2>/dev/null || true
     log "--- Services Status Summary ---" "$SUMMARY_FILE"
     for svc in "${SERVICES[@]}"; do
         local status
         status=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
         echo "$svc: $status" >> "$SUMMARY_FILE"
     done
-
+    
+    # 알림 요약
     log "--- Recent Alerts Summary ---" "$SUMMARY_FILE"
-    if [ -f "$RUN_ALERTS_FILE" ]; then
-        local alert_tail=$(tail -n 20 "$RUN_ALERTS_FILE")
-        echo "$alert_tail" >> "$SUMMARY_FILE"
-    fi
+    tail -n 20 "$RUN_ALERTS_FILE" >> "$SUMMARY_FILE"
 
-    # 알림 전송 조건: CRIT 또는 WARN이 최근에 있었던 경우
+    generate_alert_statistics "$SUMMARY_FILE"
+
+    # 알림 전송 조건: WARN이나 CRIT이 있는 경우
     if grep -q "\[CRIT\]\|\[WARN\]" "$RUN_ALERTS_FILE"; then
-        # 메일 전체 전송
-        mail -s "Server Monitoring Summary - $(hostname) - $(date +%F)" "$ALERT_EMAIL" < "$SUMMARY_FILE"
-
-        # 슬랙에는 상단 요약만 전송
-        local slack_head=$(head -n 40 "$SUMMARY_FILE")
-        send_slack_alert "Server Monitoring Summary - $(hostname) - $(date +%F)" "$slack_head" "INFO"
+        cat "$SUMMARY_FILE" | mail -s "Server Monitoring Summary - $(hostname) - $(date +%F)" "$ALERT_EMAIL"
+        send_slack_alert "Server Monitoring Summary - $(hostname) - $(date +%F)" "$(cat "$SUMMARY_FILE")" "INFO"
     fi
 }
 
