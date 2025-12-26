@@ -1,0 +1,16 @@
+# 로그 파일
+log/
+*.log
+
+# 임시 파일
+*.tmp
+.tmp_*
+
+# 시스템 파일
+.DS_Store
+*.swp
+*.swo
+
+# 민감 정보 (환경변수로 관리)
+.env
+*.secret

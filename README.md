@@ -1,240 +1,635 @@
-# 🖥️ server_monitoring.sh
+# 🖥️ 통합 서버 모니터링 스크립트
 
-> 통합 서버 모니터링 & 알림 자동화 스크립트 (2025)
----
+> **Version**: 2025.06  
+> **Author**: Server Operations Team  
+> **License**: Internal Use Only
 
-## 📌 개요
+## 📋 개요
 
- 스크립트는 Linux 기반  서버의 다양한 자원 상태 및 보안 이벤트에 대해 **주기적인 상태 모니터링, 자동 복구, 자동 Slack/Email 경고 전송, 일일 요약 보고서 생성**을 수행하는 통합 스크립트입니다. 운영 서버의 안정성과 보안 수준을 향상시키기 위해 만들어졌습니다.
+이 스크립트는 Linux 서버의 종합적인 모니터링을 수행하는 Bash 기반 자동화 도구입니다. 시스템 리소스, 네트워크, 서비스, 컨테이너, SSH 보안 등을 실시간으로 감시하고, 문제 발생 시 관리자에게 즉시 알림을 전송합니다.
 
+## ✨ 주요 기능
 
-**주요 모니터링 항목**
-- 시스템 리소스 (CPU, Memory, Disk, Load)
-- 프로세스/서비스 상태 및 자동 복구
-- Docker 컨테이너 상태 및 로그
-- 네트워크/SSH 안정성 및 보안
-- 좀비 프로세스/로그 및 발생 알림
-- Label Studio 백업 상태
-- bash history 자동 백업
-- 자동 요약 보고서 생성 및 전송
+### 🔐 **SSH 보안 모니터링**
+- **SSH 연결 안정성 감시**: 연결 끊김, 세션 수, CLOSE_WAIT 소켓 감지
+- **브루트포스 공격 탐지**: 로그인 실패 시도 분석 및 공격 IP 추적
+- **Fail2Ban 연동**: 자동 차단 IP 모니터링 및 반복 공격자 분석
+- **SSH 설정 검증**: ClientAliveInterval 등 보안 설정 점검
 
----
+### 💻 **시스템 리소스 모니터링**
+- **디스크 사용량**: 마운트별 용량 및 inode 사용률 감시
+- **메모리 감시**: 메모리 사용률 및 스왑 사용량 추적
+- **CPU 부하**: Load Average 및 프로세스별 CPU 사용률 분석
+- **네트워크 상태**: 연결 상태, 대역폭 사용량, DNS 해상도 테스트
 
-## 📂 구성 개요
+### 🐳 **컨테이너 및 서비스 관리**
+- **Docker 모니터링**: 컨테이너 상태, 볼륨 사용량, 로그 분석
+- **Kubernetes 지원**: Pod 상태 및 리소스 사용량 감시
+- **서비스 상태**: systemd 서비스 자동 재시작 및 상태 추적
 
-- **스크립트 위치**: `/home/user/arsim/opt_script/server_monitoring.sh`
-- **로그 저장 위치**: `/home/user/arsim/opt_script/log/`
-- **백업 스크립트 위치**: `label_studio_export_backup.py`
-- **크론탭 등록 예시**: 아래 참고
+### 🚨 **자동 알림 시스템**
+- **다중 채널 알림**: 이메일 + Slack 통합 알림
+- **중복 방지**: 동일 알림 재전송 방지 로직
+- **레벨별 알림**: INFO, WARN, CRIT 단계별 알림 관리
+- **시스템 정보 자동 첨부**: 에러 발생시 시스템 상태 정보 자동 포함
 
----
+### 📊 **로그 관리 및 분석**
+- **통합 로깅**: 기능별 로그 파일 자동 생성 및 관리
+- **자동 압축**: 오래된 로그 파일 자동 압축 및 아카이빙
+- **시스템 이벤트 분석**: kernel panic, OOM, 보안 이벤트 탐지
+
+## 🔧 설치 및 설정
+
+### 전제 조건
+
+```bash
+# 필수 패키지 설치 (Ubuntu/Debian)
+sudo apt-get update
+sudo apt-get install -y bc mail-utils curl wget
+
+# 필수 패키지 설치 (CentOS/RHEL)
+sudo yum install -y bc mailx curl wget
+# 또는 (최신 버전)
+sudo dnf install -y bc mailx curl wget
+
+# 선택적 패키지 (모니터링 기능 향상)
+sudo apt-get install -y lm-sensors ifstat sysstat fail2ban
+
+# Python 패키지 (Label Studio 백업 사용시)
+pip install -r requirements.txt
+# 또는
+pip install label-studio-sdk requests
+```
+
+### 스크립트 설치
+
+```bash
+# 1. 스크립트 디렉토리 생성
+sudo mkdir -p /home/user/arsim/opt_script
+cd /home/user/arsim/opt_script
+
+# 2. 스크립트 다운로드 (또는 복사)
+sudo wget -O server_monitoring.sh [스크립트_URL]
+# 또는
+sudo cp server_monitoring.sh /home/user/arsim/opt_script/
+
+# 3. 실행 권한 부여
+sudo chmod +x server_monitoring.sh
+
+# 4. 로그 디렉토리 생성
+sudo mkdir -p /home/user/arsim/opt_script/log/{archive,run_alerts}
+```
+
+### 설정 파일 수정
+
+스크립트는 환경변수로 설정을 오버라이드할 수 있습니다:
+
+```bash
+# 서버 식별자 (환경변수로 오버라이드 가능)
+HOST_ID="${HOST_ID:-sv3}"
+
+# 알림 설정 (환경변수로 오버라이드 가능)
+ALERT_EMAIL="${ALERT_EMAIL:-admin@company.com}"
+SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"  # 환경변수 필수
+
+# 경로 설정 (스크립트 위치 기준 자동 설정)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_BASE="${LOG_BASE:-${SCRIPT_DIR}/log}"
+
+# 임계값 (기본값 사용 가능)
+SSH_BLOCK_THRESHOLD="${SSH_BLOCK_THRESHOLD:-15}"
+SSH_DISCONNECT_THRESHOLD="${SSH_DISCONNECT_THRESHOLD:-20}"
+```
+
+### 환경변수 설정 (권장)
+
+```bash
+# /etc/environment 또는 ~/.bashrc에 추가
+export HOST_ID="production-server-01"
+export ALERT_EMAIL="ops@company.com,admin@company.com"
+export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/XXX/YYY/ZZZ"
+
+# 또는 실행 시 직접 지정
+SLACK_WEBHOOK_URL="https://..." ./server_monitoring.sh
+```
+
+> ⚠️ **보안 주의**: `SLACK_WEBHOOK_URL`은 스크립트에 직접 기록하지 마세요. 환경변수로 설정하세요.
+
+## 📅 사용법
+
+### 수동 실행
+
+```bash
+# 전체 모니터링 실행
+sudo ./server_monitoring.sh
+
+# SSH 모니터링만 실행
+sudo ./server_monitoring.sh ssh_only
+
+# 요약 보고서만 생성
+sudo ./server_monitoring.sh summary_only
+```
+
+### 자동 실행 (Crontab)
+
+```bash
+# 1. crontab 편집
+sudo crontab -e
+
+# 2. 다음 라인 추가 (매 15분마다 실행)
+*/15 * * * * /home/user/arsim/opt_script/server_monitoring.sh >> /var/log/monitoring_cron.log 2>&1
+
+# 3. 일일 요약 보고서 (매일 오전 9시)
+0 9 * * * /home/user/arsim/opt_script/server_monitoring.sh summary_only
+```
+
+### 서비스 등록 (systemd)
+
+```bash
+# 1. 서비스 파일 생성
+sudo tee /etc/systemd/system/server-monitoring.service << EOF
+[Unit]
+Description=Server Monitoring Script
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/user/arsim/opt_script/server_monitoring.sh
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 2. 타이머 파일 생성 (15분마다 실행)
+sudo tee /etc/systemd/system/server-monitoring.timer << EOF
+[Unit]
+Description=Run Server Monitoring every 15 minutes
+Requires=server-monitoring.service
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# 3. 서비스 활성화
+sudo systemctl daemon-reload
+sudo systemctl enable server-monitoring.timer
+sudo systemctl start server-monitoring.timer
+
+# 4. 상태 확인
+sudo systemctl status server-monitoring.timer
+```
 
 ## 📁 디렉토리 구조
 
 ```
 /home/user/arsim/opt_script/
+├── server_monitoring.sh           # 메인 통합 스크립트 (cron 실행용)
+├── gpu_inspect.sh                 # GPU 사용 프로세스 추적
+├── install_monitoring_suite.sh    # 자동 설치 스크립트
+├── README.md                      # 이 파일
 │
-├── server_monitoring.sh             # 메인 모니터링 스크립트
-├── label_studio_export_backup.py   # LabelStudio 백업용 스크립트
-├── log/
-│   ├── *.log                        # 개별 기능 로그
-│   ├── archive/                     # 압축된 오래된 로그
-│   └── run_alerts_*.log             # 실행별 경고 요약
+├── srv_monitor/                   # 개별 모니터링 스크립트 (독립 실행용)
+│   ├── disk_monitor_quick.sh      # 빠른 디스크 체크 (가벼움)
+│   ├── disk_monitor_detail.sh     # 상세 디스크 분석 (추세 분석)
+│   ├── disk_monitor_config.sh     # 디스크 모니터링 설정
+│   ├── container_size_check.sh    # Docker 컨테이너 크기 분석
+│   ├── docker_prune_check.sh      # 미사용 Docker 이미지/볼륨 확인
+│   ├── monitor_iftop.sh           # 네트워크 트래픽 상세 모니터링
+│   ├── nas_monitor_regular.sh     # 원격 NAS 디스크 모니터링
+│   └── ssmtp.conf                 # 이메일 발송 설정 가이드
+│
+├── backup_scripts/                # 백업 관련 스크립트
+│   ├── transfer_data.sh           # rsync 데이터 백업 전송
+│   └── label_studio_export_backup.py  # Label Studio 백업
+│
+└── log/                           # 로그 디렉토리
+    ├── global_YYYY-MM-DD.log      # 전체 로그
+    ├── ssh_stability_YYYY-MM-DD.log
+    ├── ssh_security_YYYY-MM-DD.log
+    ├── system_summary_YYYY-MM-DD.log
+    ├── alerts_YYYY-MM-DD.log      # 알림 로그
+    ├── archive/                   # 압축된 로그
+    │   ├── YYYY-MM-DD_logs.tar.gz
+    │   └── alerts_YYYY-MM-DD.tar.gz
+    └── run_alerts/                # 실행별 알림 로그
+        └── run_alerts_YYYY-MM-DD_HHMMSS.log
 ```
 
----
+## 🔧 스크립트 관계 및 사용 시나리오
 
-## 🔧 주요 기능
+### server_monitoring.sh vs srv_monitor/ 개별 스크립트
 
-| 카테고리                   | 기능 설명                                           |
-| ---------------------- | ----------------------------------------------- |
-| **시스템 요약**             | uptime, CPU/메모리/디스크/네트워크 정보, 로그인 사용자 기록         |
-| **디스크 감시**             | 사용량 임계치 초과, inode 확인, 급증 감지, 불필요 파일 검토          |
-| **도커 볼륨 감시**           | 볼륨별 사용량 점검, 미설치 시 경고 전송                         |
-| **네트워크 감시**            | 연결 상태, 대역폭, ping 실패, DNS 해상도 오류 감지              |
-| **프로세스 사용량**           | 과도한 자원 사용 프로세스 감지 및 종료 또는 컨테이너 재시작              |
-| **I/O 과다 탐지**          | `iotop`, `pidstat`, `vmstat`로 I/O 병목 점검         |
-| **서비스 상태 점검**          | nginx, sshd 등 지정 서비스 및 도커 컨테이너 상태 확인            |
-| **시스템 온도**             | `lm-sensors` 기반, 임계 온도 초과 시 경고                  |
-| **로그 분석**              | journalctl / auth.log 분석 (SSH 실패, OOM, panic 등) |
-| **좀비 프로세스**            | 좀비 감지 및 SIGCHLD 처리, 필요 시 컨테이너 재시작               |
-| **Label Studio 백업 확인** | 백업 스크립트 실행 후 성공 여부 확인 및 실패 시 알림                 |
-| **로그 정리 및 요약**         | 오래된 로그 정리/압축, 일일 Slack/Email 요약 보고서 생성          |
-| **SSH/Fail2Ban 감시**    | 로그인 시도/차단 IP 추적, 설정 최적화 추천 포함                   |
+| 구분 | server_monitoring.sh | srv_monitor/ 개별 스크립트 |
+|------|---------------------|---------------------------|
+| **용도** | cron으로 주기적 통합 실행 | 특정 상황에서 독립 실행 |
+| **알림** | 이메일+Slack 통합 | 개별 이메일 알림 |
+| **범위** | 모든 체크 한 번에 수행 | 특정 항목만 체크 |
+| **무게** | 무거움 (전체 스캔) | 가벼움 (선택적 실행) |
 
----
-
-## 🚨 보안 관련 주의사항
-
-- `SLACK_WEBHOOK_URL`, `ALERT_EMAIL`은 외부 노출되지 않도록 반드시 **.env 또는 secrets 파일에서 관리**하십시오.
-- 스크립트는 `root` 권한으로 실행되어야 하므로 실행 파일 권한을 `chmod 700` 등으로 제한하세요.
-- 로그 및 히스토리 백업 경로에 민감 정보가 저장될 수 있으니 **외부 접근을 방지**하십시오.
-- 스크립트 내에서 임의의 프로세스 종료 또는 컨테이너 재시작을 수행하므로, **화이트리스트 키워드(db, prod 등)**를 주의 깊게 설정하세요.
-- `.alert_sent_cache`, `.prev_disk_usage`와 같은 파일에는 이력 정보가 저장되므로 접근권한 제한 또는 주기적 삭제를 권장합니다.
-
----
-
-## ✅ 사용 방법
-
-### (필요 패키지 설치)
+### 사용 시나리오
 
 ```bash
-sudo apt update && sudo apt install -y \
-  mailutils curl bc coreutils \
-  lm-sensors ifstat iotop sysstat \
-  net-tools dnsutils fail2ban
-```
-- `bc`, `mail`, `docker`, `sensors`, `iotop`, `ifstat`, `pidstat`, `vmstat`, `iostat`, `fail2ban`, `lm-sensors`
-> 💡 `iotop`, `ifstat`, `sensors` 등 일부는 선택사항이지만 설치를 권장합니다.
+# 1. 정기 모니터링 (cron) - 통합 스크립트 사용
+*/15 * * * * /opt/scripts/server_monitoring.sh
 
-### 일반 실행
+# 2. 디스크 문제 발생 시 - 빠른 체크
+./srv_monitor/disk_monitor_quick.sh
+
+# 3. 디스크 상세 분석 필요 시 - 추세 분석
+./srv_monitor/disk_monitor_detail.sh
+
+# 4. Docker 정리 전 확인
+./srv_monitor/docker_prune_check.sh
+
+# 5. 컨테이너별 용량 확인
+./srv_monitor/container_size_check.sh
+
+# 6. NAS 용량 확인 (원격)
+./srv_monitor/nas_monitor_regular.sh
+```
+
+## 🚨 알림 시스템
+
+### 알림 레벨
+
+| 레벨 | 설명 | 이메일 | Slack | 시스템 정보 첨부 |
+|------|------|--------|-------|------------------|
+| **INFO** | 정보성 메시지 | ❌ | ❌ | ❌ |
+| **WARN** | 경고 (주의 필요) | ✅* | ✅ | ❌ |
+| **CRIT** | 치명적 (즉시 조치 필요) | ✅ | ✅ | ✅ |
+
+*\* WARN 레벨 이메일은 `SEND_WARN_EMAILS=true` 설정시에만 전송*
+
+### 주요 알림 케이스
+
+#### 🔐 **SSH 보안 관련**
+- **SSH Brute Force Attempt** (WARN): 임계값 이상의 로그인 실패 시도
+- **Fail2Ban Banned IPs** (WARN): 새로운 IP 차단 시
+- **SSH Config Issue** (WARN): SSH 설정 문제
+- **Frequent SSH Disconnects** (WARN): 과도한 연결 끊김
+
+#### 💻 **시스템 리소스 관련**
+- **High System Load** (WARN): CPU 부하 과다
+- **Low Memory Warning** (WARN): 메모리 부족
+- **Disk Usage Critical** (CRIT): 디스크 사용량 위험 수준
+
+#### 🐳 **서비스 관련**
+- **Service Down** (CRIT): 중요 서비스 다운
+- **Container Error Spike** (WARN): 컨테이너 에러 급증
+- **Script Error** (CRIT): 스크립트 실행 오류
+
+### 알림 예시
+
+```
+Subject: -------- !! [WARN][sv3] Server Alert: SSH Brute Force Attempt !! --------
+
+Detected 25 failed SSH login attempts in the past 2 hour ago.
+
+Top new attacking IPs (threshold: 15):
+  8  192.168.1.100
+  6  10.0.0.50
+  4  172.16.0.30
+
+=== System Info ===
+Hostname: webserver-01
+OS: ubuntu 20.04
+Uptime: 5 days, 12:34
+Load: 0.45, 0.52, 0.48
+Memory: Used: 2048MB (25.6%), Available: 6144MB
+```
+
+## 🔧 고급 설정
+
+### 환경별 임계값 조정
 
 ```bash
-sudo bash server_monitoring.sh
+# 컨테이너 환경
+if is_container; then
+    SSH_DISCONNECT_THRESHOLD=50
+    SSH_SESSION_THRESHOLD=100
+fi
+
+# 쿠버네티스 노드
+if is_kubernetes_node; then
+    SSH_DISCONNECT_THRESHOLD=100
+    SSH_BLOCK_THRESHOLD=50
+fi
 ```
 
-### 일일 요약 전용 실행
+### 커스텀 모니터링 함수 추가
 
 ```bash
-sudo bash server_monitoring.sh summary_only
+# 1. 새로운 모니터링 함수 정의
+custom_application_monitor() {
+    local log_file="$LOG_BASE/custom_app_$(date +%F).log"
+    log "====== custom_application_monitor ======" "$log_file"
+    
+    # 커스텀 로직 구현
+    if ! pgrep -f "my_application" >/dev/null; then
+        send_alert "Application Down" "My application is not running" "CRIT" "custom_application_monitor"
+    fi
+}
+
+# 2. 메인 실행 함수에 추가
+run_monitoring() {
+    # ... 기존 코드 ...
+    safe_run custom_application_monitor
+    # ... 나머지 코드 ...
+}
 ```
 
-### 특정 함수만 실행하고 싶을 때:
+### 외부 설정 파일 사용
 
 ```bash
-sudo bash -c 'source ./server_monitoring.sh && check_disk_usage'
+# /etc/server-monitoring.conf 생성
+cat > /etc/server-monitoring.conf << EOF
+HOST_ID="production-web-01"
+ALERT_EMAIL="ops@company.com"
+SSH_BLOCK_THRESHOLD="10"
+ENABLE_SELF_HEALING="true"
+EOF
+
+# 스크립트에서 설정 파일 로드
+if [[ -f /etc/server-monitoring.conf ]]; then
+    source /etc/server-monitoring.conf
+fi
 ```
 
----
-## 🔒 보안 및 SSH 감지
+## 🐛 문제 해결
 
-- SSH 로그인 실패, 세션 수, 구성수 ClientAlive 등 점검
-- Fail2Ban 상태 및 복중 공격자 IP 추적
-- 좀비 프로세스 감지 및 커테이너 단위 재시작
-- bash history 자동 백업 (`/root`, `/home/*`)
+### 자주 발생하는 문제
 
----
+#### 1. 메일 전송 실패
+```bash
+# 메일 시스템 확인
+sudo systemctl status postfix
+sudo tail -f /var/log/mail.log
 
-## ⏰ 크론탭 설정 예시
+# 테스트 메일 전송
+echo "Test message" | mail -s "Test Subject" admin@company.com
+```
+
+#### 2. 권한 문제
+```bash
+# 스크립트 권한 확인
+ls -la /home/user/arsim/opt_script/server_monitoring.sh
+
+# 로그 디렉토리 권한 확인
+sudo chown -R root:root /home/user/arsim/opt_script/log
+sudo chmod -R 755 /home/user/arsim/opt_script/log
+```
+
+#### 3. journalctl 접근 오류
+```bash
+# systemd-journal 그룹에 사용자 추가
+sudo usermod -a -G systemd-journal root
+
+# 또는 전통적인 로그 파일 사용 강제
+export FORCE_TRADITIONAL_LOGS=true
+```
+
+#### 4. Slack 알림 실패
+```bash
+# 웹훅 URL 테스트
+curl -X POST -H 'Content-type: application/json' \
+  --data '{"text":"Test message"}' \
+  YOUR_SLACK_WEBHOOK_URL
+
+# 네트워크 연결 확인
+ping -c 3 hooks.slack.com
+```
+
+### 디버깅 모드
 
 ```bash
-# 매 30분마다 전체 모니터링
-*/30 * * * * bash /home/user/arsim/opt_script/server_monitoring.sh >> /home/user/arsim/opt_script/log/cron_monitoring.log 2>&1
+# 디버그 정보 활성화
+export DEBUG_MODE=true
+bash -x ./server_monitoring.sh
 
-# 매일 오전 8시 요약 보고
-0 8 * * * bash /home/user/arsim/opt_script/server_monitoring.sh summary_only >> /home/user/arsim/opt_script/log/daily_summary.log 2>&1
+# 특정 함수만 테스트
+source ./server_monitoring.sh
+monitor_ssh_security
+```
+
+## 📊 로그 분석
+
+### 로그 파일 위치 및 내용
+
+```bash
+# 전체 실행 로그
+tail -f /home/user/arsim/opt_script/log/global_$(date +%F).log
+
+# SSH 보안 로그
+tail -f /home/user/arsim/opt_script/log/ssh_security_$(date +%F).log
+
+# 알림 로그
+tail -f /home/user/arsim/opt_script/log/alerts_$(date +%F).log
+
+# 실시간 모니터링
+watch -n 5 'tail -20 /home/user/arsim/opt_script/log/global_$(date +%F).log'
+```
+
+### 로그 검색 예시
+
+```bash
+# SSH 공격 분석
+grep "Brute Force" /home/user/arsim/opt_script/log/alerts_*.log
+
+# 시스템 오류 검색
+grep -i "CRIT\|ERROR" /home/user/arsim/opt_script/log/global_*.log
+
+# 특정 IP 추적
+grep "192.168.1.100" /home/user/arsim/opt_script/log/ssh_security_*.log
+
+# 알림 통계
+grep -c "send_alert" /home/user/arsim/opt_script/log/global_$(date +%F).log
+```
+
+## 🔄 업데이트 및 유지보수
+
+### 스크립트 업데이트
+
+```bash
+# 백업 생성
+sudo cp server_monitoring.sh server_monitoring.sh.backup.$(date +%F)
+
+# 새 버전 배포
+sudo wget -O server_monitoring.sh.new [NEW_VERSION_URL]
+sudo chmod +x server_monitoring.sh.new
+
+# 설정 검증 후 교체
+sudo ./server_monitoring.sh.new --config-test
+sudo mv server_monitoring.sh.new server_monitoring.sh
+```
+
+### 정기 유지보수
+
+```bash
+# 1. 로그 정리 (30일 이상된 파일 삭제)
+find /home/user/arsim/opt_script/log -name "*.log" -mtime +30 -delete
+
+# 2. 압축 아카이브 정리 (90일 이상)
+find /home/user/arsim/opt_script/log/archive -name "*.tar.gz" -mtime +90 -delete
+
+# 3. 캐시 파일 정리
+rm -f /tmp/ssh_alert_cache.txt /tmp/fail2ban_*.txt
+
+# 4. 설정 검증
+./server_monitoring.sh --validate-config
+```
+
+## 📈 성능 최적화
+
+### 리소스 사용량 최소화
+
+```bash
+# 불필요한 모니터링 비활성화
+export SKIP_DOCKER_MONITORING=true
+export SKIP_KUBERNETES_MONITORING=true
+
+# 로그 레벨 조정
+export LOG_LEVEL=WARN  # INFO 로그 건너뛰기
+
+# 타임아웃 단축
+export COMMAND_TIMEOUT=15
+export JOURNALCTL_TIMEOUT=10
+```
+
+### 대용량 환경 최적화
+
+```bash
+# 병렬 처리 활성화
+export ENABLE_PARALLEL_MONITORING=true
+
+# 샘플링 모니터링 (매번이 아닌 주기적으로)
+export SAMPLE_MONITORING_INTERVAL=3  # 3번 중 1번만 실행
+```
+
+## 🔒 보안 고려사항
+
+### 스크립트 보안
+
+```bash
+# 1. 파일 권한 제한
+sudo chmod 750 server_monitoring.sh
+sudo chown root:root server_monitoring.sh
+
+# 2. 로그 파일 권한
+sudo chmod 640 /home/user/arsim/opt_script/log/*.log
+sudo chown root:adm /home/user/arsim/opt_script/log/*.log
+
+# 3. 중요 정보 마스킹
+export MASK_IP_ADDRESSES=true
+export MASK_USERNAMES=true
+```
+
+### 알림 보안
+
+```bash
+# Slack 웹훅 URL 환경 변수로 분리
+export SLACK_WEBHOOK_URL_FILE="/etc/monitoring/slack-webhook"
+echo "https://hooks.slack.com/services/..." | sudo tee /etc/monitoring/slack-webhook
+sudo chmod 600 /etc/monitoring/slack-webhook
+```
+
+## 🤝 기여 및 지원
+
+### 버그 리포트
+
+버그 발견시 다음 정보와 함께 리포트해주세요:
+
+1. **OS 정보**: `cat /etc/os-release`
+2. **스크립트 버전**: 스크립트 상단 버전 정보
+3. **에러 로그**: 관련 로그 파일 내용
+4. **재현 단계**: 문제 재현 방법
+
+### 개발 가이드라인
+
+```bash
+# 1. 함수명 규칙
+function_name()  # 소문자 + 언더스코어
+
+# 2. 변수명 규칙
+readonly GLOBAL_CONSTANT="value"  # 전역 상수: 대문자
+local local_variable="value"      # 지역 변수: 소문자
+
+# 3. 에러 처리
+set -euo pipefail  # 엄격한 에러 처리
+validate_number "$input" "default_value"  # 입력 검증
+
+# 4. 로그 규칙
+log "→ Success message" "$LOG_FILE"     # 성공
+log "⚠️ Warning message" "$LOG_FILE"    # 경고  
+log "❌ Error message" "$LOG_FILE"      # 에러
 ```
 
 ---
 
-## 📬 알림 구성
+## 🛡️ Fail2Ban 가이드
 
-- **Slack 알림**: `SLACK_WEBHOOK_URL`로 전송, WARN/CRIT 알림만 발송
-- **Email 알림**: `mail` 명령 사용, CRIT은 무조건, WARN은 설정에 따라 전송 (ALERT_EMAIL 필수)
+### 차단 IP 확인 및 로그
+```bash
+# 현재 차단된 IP 목록 확인
+fail2ban-client status sshd | grep 'Banned IP list'
 
-> CRIT 수준은 무조건 전송, WARN 수준은 `SEND_WARN_EMAILS=true` 설정시 전송됩니다.
-
----
-
-## 📜 관련 로그 파일
-
-| 파일                           | 설명                      |
-| ---------------------------- | ----------------------- |
-| `global_<date>.log`          | 전체 실행 로그                |
-| `run_alerts_<date_time>.log` | 이번 실행 중 발생한 경고/치명 알림 모음 |
-| `summary_current_<date>.log` | 최신 일일 요약 보고서            |
-| `.alert_sent_cache`          | 알림 중복 방지를 위한 캐시 파일      |
-| `.prev_disk_usage`           | 디스크 사용량 비교용 캐시          |
-
----
-
-
-
-
-
----
-
-## 📊 보고서 예시
-
-스크립트는 `/log/summary_current_YYYY-MM-DD.log`에 일일 요약 보고서를 생성합니다.
-
-**Slack 알림 예시**:
-
+# 차단 IP 히스토리 로깅
+fail2ban-client status sshd | grep 'Banned IP list' >> /var/log/fail2ban_ip_history.log
 ```
-*Server Summary - server3 (2025-04-21)*
-Disk Usage (over 80%):
-  /var: 91%
-  /home: 82%
-Memory: Mem: 62G used of 64G
-Load Average: 2.11, 2.09, 2.00
-Services:
-  docker: active   nginx: active   fail2ban: active
-🚨 Recent Alerts:
-[CRIT] OOM Killer triggered
-[WARN] SSH 로그인 실패 23개
+
+### IP 차단 해제
+```bash
+sudo fail2ban-client set sshd unbanip <IP주소>
+```
+
+### Whitelist (허용 IP) 설정
+`/etc/fail2ban/jail.local` 파일에 추가:
+```ini
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+findtime = 300
+bantime = 7200
+ignoreip = 127.0.0.1 192.168.0.0/16 <회사IP대역>
+```
+
+```bash
+# 화이트리스트 확인
+sudo fail2ban-client get sshd ignoreip
+
+# 설정 반영
+sudo systemctl restart fail2ban
 ```
 
 ---
 
-## 🧠 설정 항목 정보
+## 📂 backup_scripts 폴더
 
-| 번역 | 설명 | 기본값 |
-|--------|------|--------|
-| `ENABLE_EMAIL_ALERTS` | 이메일 알림 전송 여부 | true |
-| `ENABLE_SLACK_ALERTS` | Slack 전송 여부 | true |
-| `SEND_WARN_EMAILS` | WARN 반응 이메일 전송 여부 | true |
-| `DISK_WARN`, `DISK_CRIT` | 디스크 사용율 임계치 (%) | 80 / 90 |
-| `TEMP_THRESHOLD` | CPU 온도 임계치 (°C) | 80 |
-| `ZOMBIE_WARN_THRESHOLD` | 조비 프로세스 경고 기준 | 30 |
-| `ENABLE_SELF_HEALING` | 자동 복구 기능 여부 | false |
+백업 관련 스크립트 (server_monitoring.sh와 별도 수동 관리):
 
----
+| 파일 | 용도 | 비고 |
+|------|------|------|
+| `transfer_data.sh` | rsync를 이용한 데이터 백업 전송 | 수동 실행 |
+| `label_studio_export_backup.py` | Label Studio 프로젝트 백업 | 수동 실행 또는 별도 cron |
 
-## ✅ 모듈별 기능 요약
+> ⚠️ **주의**: 백업 스크립트는 `server_monitoring.sh`에서 **자동 호출되지 않습니다**.
+> 필요시 별도 cron 작업으로 스케줄링하세요.
 
-| 모듈 | 기능 |
-|------|------|
-| `collect_system_summary` | 시스템 개요 수집 (uptime, CPU, Mem, Disk 등) |
-| `check_disk_usage` | 디스크 및 inode 사용율 확인, 갑적 증가 감지 |
-| `check_process_usage` | 고부하 프로세스 탐지 + 자동 종료/재시작 |
-| `check_services` | 서비스 상태 점검 + 재시작 시도 |
-| `analyze_system_logs` | 시스템 로그 (journalctl, auth.log) 분석 |
-| `check_io_heavy_processes` | iotop/pidstat 기능 I/O 가능 탐지 |
-| `manage_zombie_processes` | 조비 프로세스 자동 감지 및 정리 |
-| `check_network_status` | ping, ifstat, DNS 상태 점검 |
-| `check_system_temperature` | lm-sensors 기능 온돐 확인 |
-| `monitor_ssh_stability` | 세션 수, CLOSE_WAIT, SSH 설정 안정성 점검 |
-| `monitor_ssh_security` | 로그인 실패 / fail2ban 상태 확인 |
-| `analyze_container_logs` | 도커 커테이너 에러 및 재시작 비도 감지 |
-| `backup_bash_history` | root, 사용자 bash history 백업 |
-| `clean_old_logs` | 오래된 로그 압축 및 삭제 |
-| `generate_summary` | 일일 보고서 생성 및 알림 전송 |
+```bash
+# Label Studio 백업 수동 실행
+python3 /home/user/arsim/opt_script/backup_scripts/label_studio_export_backup.py
+
+# cron 스케줄링 예시 (매일 새벽 3시)
+0 3 * * * python3 /home/user/arsim/opt_script/backup_scripts/label_studio_export_backup.py
+```
 
 ---
-
-## 📌 참고
-
-- 스크립트는 루트 권한으로 실행되어야 합니다.
-- 대부분의 모듈은 실행 시 오류시 자동 복구 또는 알림만 수행하며, 시스템 자체를 변경하지 않습니다.
-- 자가 복구 기능 (`ENABLE_SELF_HEALING=true`) 활성화 시에는 주의해서 사용해야 합니다.
-
----
-
-## 📌 유지관리 체크리스트
-
-- [ ] `.env` 또는 secrets 분리 적용 여부 확인
-- [ ] 로그 및 백업 파일 접근 권한 제한 적용 여부
-- [ ] `ENABLE_SELF_HEALING=true` 설정 시 대상 화이트리스트 검토
-- [ ] 알림 캐시 파일(`.alert_sent_cache`) 주기적 삭제 스케줄 확인
-
----
-
-
-## ✍️ 작성자 및 버전
-
-- 작성자: [areum sim](mailto:sar10320@gmail.com)
-- 버전: `v1.5` (2025.04.21)
-- 위치: `/home/user/arsim/opt_script/server_monitoring.sh`
-
----
-
